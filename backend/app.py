@@ -2,9 +2,18 @@ import os
 import sqlite3
 import requests
 from datetime import datetime, timedelta
+import os
+import sqlite3
+import requests
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
+import logging
+import hashlib
+import secrets
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Header
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from passlib.context import CryptContext
 import jwt
@@ -24,6 +33,18 @@ DB_PATH = os.getenv("DATABASE_URL", "sqlite:///./users.db").replace("sqlite:///.
 MAX_FAILED_ATTEMPTS = int(os.getenv("MAX_FAILED_ATTEMPTS", "5"))
 LOCKOUT_SECONDS = int(os.getenv("LOCKOUT_SECONDS", "180"))  # default 3 minutes
 
+# Refresh token lifetime (days)
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
+
+# Limiter storage (memory by default). Set to e.g. redis://host:6379/0
+RATE_LIMITER_URI = os.getenv("RATE_LIMITER_URI", "memory://")
+
+# CORS / frontend origin
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+
+# Admin token to protect admin endpoints (set a strong token in production)
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
 # Supabase proxy configuration (optional). If set, the backend will forward
 # login requests to Supabase Auth and return Supabase's response. Requires
 # `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` to be set in the environment.
@@ -32,15 +53,22 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-limiter = Limiter(key_func=get_remote_address)
+limiter = Limiter(key_func=get_remote_address, storage_uri=RATE_LIMITER_URI)
 app = FastAPI()
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[FRONTEND_ORIGIN],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-class LoginIn(BaseModel):
-    email: str
-    password: str
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("backend")
 
 
 def get_db_conn():
@@ -49,9 +77,14 @@ def get_db_conn():
     return conn
 
 
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
 def initialize_db():
     conn = get_db_conn()
     cur = conn.cursor()
+    # users table
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -72,6 +105,20 @@ def initialize_db():
         )
         """
     )
+    # Table to hold hashed refresh tokens for local auth
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS refresh_tokens (
+            id INTEGER PRIMARY KEY,
+            email TEXT NOT NULL,
+            token_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            client_info TEXT
+        )
+        """
+    )
+
     cur.execute("SELECT COUNT(*) AS c FROM users")
     row = cur.fetchone()
     if row is None or row[0] == 0:
@@ -128,6 +175,7 @@ def record_failed_attempt(email: str):
             cur.execute("REPLACE INTO login_attempts (email, attempts, last_attempt, locked_until) VALUES (?, ?, ?, NULL)", (email, attempts, now.isoformat()))
     conn.commit()
     conn.close()
+    logger.warning("Failed login for %s (attempts updated)", email)
 
 
 def reset_attempts(email: str):
@@ -136,6 +184,62 @@ def reset_attempts(email: str):
     cur.execute("DELETE FROM login_attempts WHERE email = ?", (email,))
     conn.commit()
     conn.close()
+    logger.info("Reset login attempts for %s", email)
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def create_refresh_token(email: str, client_info: str = None) -> str:
+    token = secrets.token_urlsafe(64)
+    token_hash = _hash_token(token)
+    now = datetime.utcnow()
+    expires_at = (now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)).isoformat()
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO refresh_tokens (email, token_hash, created_at, expires_at, client_info) VALUES (?, ?, ?, ?, ?)",
+        (email, token_hash, now.isoformat(), expires_at, client_info),
+    )
+    conn.commit()
+    conn.close()
+    logger.info("Issued refresh token for %s", email)
+    return token
+
+
+def verify_refresh_token(token: str):
+    token_hash = _hash_token(token)
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, email, expires_at FROM refresh_tokens WHERE token_hash = ?", (token_hash,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return None
+    try:
+        expires_at = datetime.fromisoformat(row["expires_at"])
+    except Exception:
+        conn.close()
+        return None
+    if datetime.utcnow() > expires_at:
+        cur.execute("DELETE FROM refresh_tokens WHERE id = ?", (row["id"],))
+        conn.commit()
+        conn.close()
+        return None
+    email = row["email"]
+    conn.close()
+    return email
+
+
+def revoke_refresh_token(token: str):
+    token_hash = _hash_token(token)
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM refresh_tokens WHERE token_hash = ?", (token_hash,))
+    conn.commit()
+    conn.close()
+    logger.info("Revoked refresh token")
 
 
 @app.on_event("startup")
@@ -201,7 +305,7 @@ async def login(payload: LoginIn, request: Request):
 
     password_hash = row["password_hash"]
     if not pwd_context.verify(payload.password, password_hash):
-        # Wrong password: record failed attempt and inform user generally
+        # Wrong password: record failed attempt and inform user specifically
         try:
             record_failed_attempt(payload.email)
         except Exception:
@@ -210,7 +314,7 @@ async def login(payload: LoginIn, request: Request):
         locked, remaining = is_locked(payload.email)
         if locked:
             raise HTTPException(status_code=429, detail=f"Too many failed attempts. Try again in {remaining} seconds")
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(status_code=401, detail="wrong password")
 
     expires = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     token = jwt.encode({"sub": payload.email, "exp": expires}, JWT_SECRET, algorithm="HS256")
@@ -221,7 +325,16 @@ async def login(payload: LoginIn, request: Request):
     except Exception:
         pass
 
-    return {"access_token": token, "token_type": "bearer"}
+    # Issue a refresh token for local auth
+    try:
+        refresh_token = create_refresh_token(payload.email, client_info=request.headers.get("User-Agent"))
+    except Exception:
+        refresh_token = None
+
+    resp = {"access_token": token, "token_type": "bearer"}
+    if refresh_token:
+        resp["refresh_token"] = refresh_token
+    return resp
 
 
 @app.get("/health")
@@ -241,23 +354,98 @@ async def refresh_token_endpoint(payload: RefreshIn, request: Request):
     Expects JSON: { "refresh_token": "..." }
     Returns Supabase token response on success.
     """
-    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
-        raise HTTPException(status_code=400, detail="Refresh not configured on server")
+    # If Supabase proxy is configured, proxy the refresh request
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+        target = f"{SUPABASE_URL.rstrip('/')}/auth/v1/token?grant_type=refresh_token"
+        headers = {
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": "application/json",
+        }
 
-    target = f"{SUPABASE_URL.rstrip('/')}/auth/v1/token?grant_type=refresh_token"
-    headers = {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        "Content-Type": "application/json",
-    }
+        try:
+            resp = requests.post(target, headers=headers, json={"refresh_token": payload.refresh_token}, timeout=10)
+        except requests.RequestException:
+            raise HTTPException(status_code=502, detail="Auth proxy error")
 
+        if resp.status_code != 200:
+            detail = resp.json().get("error_description") or resp.json().get("error") or "Unable to refresh token"
+            raise HTTPException(status_code=401, detail=detail)
+
+        return resp.json()
+
+    # Local refresh handling (for SQLite-backed local auth)
+    email = verify_refresh_token(payload.refresh_token)
+    if not email:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    # Issue new access token
+    expires = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    token = jwt.encode({"sub": email, "exp": expires}, JWT_SECRET, algorithm="HS256")
+
+    # Rotate refresh token: revoke old and issue a new one
     try:
-        resp = requests.post(target, headers=headers, json={"refresh_token": payload.refresh_token}, timeout=10)
-    except requests.RequestException:
-        raise HTTPException(status_code=502, detail="Auth proxy error")
+        revoke_refresh_token(payload.refresh_token)
+        new_refresh = create_refresh_token(email)
+    except Exception:
+        new_refresh = None
 
-    if resp.status_code != 200:
-        detail = resp.json().get("error_description") or resp.json().get("error") or "Unable to refresh token"
-        raise HTTPException(status_code=401, detail=detail)
+    result = {"access_token": token, "token_type": "bearer"}
+    if new_refresh:
+        result["refresh_token"] = new_refresh
+    return result
 
-    return resp.json()
+
+@app.post("/logout")
+async def logout(payload: RefreshIn):
+    """Revoke a refresh token (local auth)."""
+    # If Supabase is configured, clients should call Supabase logout.
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=400, detail="Logout handled by Supabase when proxying")
+
+    revoke_refresh_token(payload.refresh_token)
+    return JSONResponse(status_code=204, content={})
+
+
+def _check_admin(token: str):
+    if not ADMIN_TOKEN:
+        return False
+    return secrets.compare_digest(token, ADMIN_TOKEN)
+
+
+@app.get("/admin/login_attempts")
+async def admin_list_attempts(x_admin_token: str = Header(None)):
+    if not _check_admin(x_admin_token):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT email, attempts, last_attempt, locked_until FROM login_attempts")
+    rows = cur.fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        out.append({"email": r[0], "attempts": r[1], "last_attempt": r[2], "locked_until": r[3]})
+    return out
+
+
+@app.post("/admin/reset_attempts")
+async def admin_reset_attempts(payload: LoginIn, x_admin_token: str = Header(None)):
+    if not _check_admin(x_admin_token):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    reset_attempts(payload.email)
+    return {"status": "ok"}
+
+
+@app.get("/admin/refresh_tokens")
+async def admin_list_refresh(x_admin_token: str = Header(None)):
+    if not _check_admin(x_admin_token):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, email, created_at, expires_at, client_info FROM refresh_tokens")
+    rows = cur.fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        out.append({"id": r[0], "email": r[1], "created_at": r[2], "expires_at": r[3], "client_info": r[4]})
+    return out
