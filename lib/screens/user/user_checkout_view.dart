@@ -40,7 +40,7 @@ class _UserCheckoutViewState extends State<UserCheckoutView> {
       final orderId = _cartService.placeOrder(
         _userId,
         _userName,
-        _authService.currentUser?.email ?? 'user@example.com',
+        _authService.getUserEmail() ?? 'user@example.com',
         deliveryAddress: _addressController.text.trim(),
         phoneNumber: _phoneController.text.trim(),
       );

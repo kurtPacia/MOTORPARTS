@@ -50,7 +50,7 @@ class _ProductDetailsPageState extends State<ProductDetailsPage>
   void _checkLoginStatus() {
     setState(() {
       _isLoggedIn = _authService.isLoggedIn;
-      _userId = _authService.currentUserId ?? _authService.currentUser?.id;
+      _userId = _authService.currentUserId ?? '';
     });
   }
 

@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
-import 'supabase_config.dart';
+import 'services/database_service.dart';
 import 'utils/theme.dart';
 import 'utils/constants.dart';
 import 'utils/role_guard.dart';
@@ -32,11 +31,9 @@ import 'screens/auth/register_page.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Initialize Supabase
-  await Supabase.initialize(
-    url: SupabaseConfig.supabaseUrl,
-    anonKey: SupabaseConfig.supabaseAnonKey,
-  );
+  // Initialize SQLite database
+  await DatabaseService().database;
+  debugPrint('✅ SQLite database initialized');
 
   runApp(const MyApp());
 }

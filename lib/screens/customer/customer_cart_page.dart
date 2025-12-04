@@ -15,8 +15,7 @@ class _CustomerCartPageState extends State<CustomerCartPage> {
   final CartService _cartService = CartService();
   final AuthService _authService = AuthService();
 
-  String? get _userId =>
-      _authService.currentUserId ?? _authService.currentUser?.id;
+  String? get _userId => _authService.currentUserId ?? '';
 
   @override
   Widget build(BuildContext context) {
