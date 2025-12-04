@@ -12,6 +12,8 @@ import hashlib
 import secrets
 
 from fastapi import FastAPI, Request, HTTPException, Header
+import time
+import asyncio
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -56,7 +58,19 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 limiter = Limiter(key_func=get_remote_address, storage_uri=RATE_LIMITER_URI)
 app = FastAPI()
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+async def _logging_rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded):
+    # Log the event for debugging (client IP, path)
+    client = getattr(request, "client", None)
+    ip = client.host if client else "unknown"
+    try:
+        logger.warning("RateLimitExceeded: path=%s ip=%s detail=%s", request.url.path, ip, getattr(exc, 'detail', ''))
+    except Exception:
+        logger.warning("RateLimitExceeded (failed to log details)")
+    return await _rate_limit_exceeded_handler(request, exc)
+
+app.add_exception_handler(RateLimitExceeded, _logging_rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(
     CORSMiddleware,
@@ -69,6 +83,45 @@ app.add_middleware(
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("backend")
+
+# In-process rate limiter config (fallback when no shared store)
+INPROC_IP_LIMIT = int(os.getenv("INPROC_IP_LIMIT", "10"))
+INPROC_IP_WINDOW = int(os.getenv("INPROC_IP_WINDOW", "60"))
+INPROC_EMAIL_LIMIT = int(os.getenv("INPROC_EMAIL_LIMIT", "5"))
+INPROC_EMAIL_WINDOW = int(os.getenv("INPROC_EMAIL_WINDOW", "60"))
+
+
+class RateLimiter:
+    """Simple in-process fixed-window rate limiter.
+
+    Note: counters are stored in memory and reset on process restart.
+    Use Redis for production multi-instance deployments.
+    """
+
+    def __init__(self):
+        self._counters = {}  # key -> (count, reset_ts)
+        self._lock = asyncio.Lock()
+
+    async def allow(self, key: str, limit: int, window_seconds: int):
+        now = time.time()
+        async with self._lock:
+            count, reset = self._counters.get(key, (0, now + window_seconds))
+            if now >= reset:
+                count = 0
+                reset = now + window_seconds
+            count += 1
+            self._counters[key] = (count, reset)
+            if count > limit:
+                return False, int(reset - now)
+            return True, 0
+
+    async def reset(self, key: str):
+        async with self._lock:
+            if key in self._counters:
+                del self._counters[key]
+
+
+inproc_limiter = RateLimiter()
 
 
 def get_db_conn():
@@ -254,6 +307,23 @@ async def login(payload: LoginIn, request: Request):
     # Auth endpoint and return its response. This keeps user management
     # centralized in Supabase while allowing this backend to enforce
     # rate-limits and additional business logic.
+    # In-process rate limiting (IP + per-email) — runs even without Redis
+    client = getattr(request, "client", None)
+    ip = client.host if client else "unknown"
+    try:
+        allowed_ip, wait_ip = await inproc_limiter.allow(f"ip:{ip}", INPROC_IP_LIMIT, INPROC_IP_WINDOW)
+    except Exception:
+        allowed_ip, wait_ip = True, 0
+    if not allowed_ip:
+        raise HTTPException(status_code=429, detail=f"Too many requests from your IP. Try again in {wait_ip} seconds")
+
+    try:
+        allowed_email, wait_email = await inproc_limiter.allow(f"email:{payload.email}", INPROC_EMAIL_LIMIT, INPROC_EMAIL_WINDOW)
+    except Exception:
+        allowed_email, wait_email = True, 0
+    if not allowed_email:
+        raise HTTPException(status_code=429, detail=f"Too many requests for this account. Try again in {wait_email} seconds")
+
     # Check per-email lockout before attempting auth (works for both Supabase proxy and local auth)
     locked, remaining = is_locked(payload.email)
     if locked:
