@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "957385899596",
+    "project_id": "ffk-enterprise",
+    "storage_bucket": "ffk-enterprise.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:957385899596:android:ed7d362f7d13b7e54b3ee9",
+        "android_client_info": {
+          "package_name": "com.FKK.com.FKKenterprise"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBhu2viDE40UGJlJ9x0lnEubPR8yptuk4M"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
