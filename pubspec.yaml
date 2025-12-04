@@ -56,6 +56,7 @@ dependencies:
   
   # HTTP
   dio: ^5.4.0
+  flutter_secure_storage: ^8.0.0
   
   # Maps
   google_maps_flutter: ^2.5.0

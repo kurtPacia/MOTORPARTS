@@ -8,6 +8,10 @@ class SupabaseConfig {
   static const String supabaseAnonKey =
       'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1xb292bm9lbmp4aGV6bWZnd3V5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQwMjE5NTYsImV4cCI6MjA3OTU5Nzk1Nn0.ORIXfYLn8Ykq9OX2nDO9yLVLCvhRm7e5CEGpUCbZ6NA';
 
+    // Backend URL for the optional FastAPI proxy (used for rate-limited login/refresh)
+    // On Android emulator use `http://10.0.2.2:8000`, on a device use your machine IP or deployed URL.
+    static const String backendUrl = 'http://10.0.2.2:8000';
+
   // Optional: You can add other configuration here
   static const String authCallbackUrlHostname =
       'YOUR_APP_SCHEME'; // e.g., 'com.yourcompany.motorshop'

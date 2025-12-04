@@ -2,6 +2,9 @@ import 'package:flutter/foundation.dart';
 import 'package:crypto/crypto.dart';
 import 'dart:convert';
 import 'database_service.dart';
+import 'package:dio/dio.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import '../supabase_config.dart';
 
 class AuthService {
   final DatabaseService _db = DatabaseService();
@@ -30,6 +33,10 @@ class AuthService {
   static String? _currentRole;
   static String? _currentUserId;
   static bool _isSessionActive = false;
+
+  // HTTP client and secure storage
+  final Dio _dio = Dio();
+  final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
 
   // Getters
   String? get currentUsername => _currentUsername;
@@ -83,35 +90,56 @@ class AuthService {
         }
       }
 
-      // Check database for real users
-      final hashedPassword = _hashPassword(password);
-      final user = await _db.getUserByEmail(email);
+      // POST to backend login endpoint (proxy to Supabase). Backend enforces rate limits.
+      final url = '${SupabaseConfig.backendUrl}/login';
+      final resp = await _dio.post(url, data: {'email': email, 'password': password});
 
-      if (user == null) {
-        debugPrint('❌ User not found: $email');
+      if (resp.statusCode == 200) {
+        final data = resp.data;
+
+        // If proxied to Supabase, response will include access_token, refresh_token, user, expires_in
+        final accessToken = data['access_token'] as String?;
+        final refreshToken = data['refresh_token'] as String?;
+        final user = data['user'];
+        final expiresIn = data['expires_in']; // seconds
+
+        // Save tokens securely if present
+        if (accessToken != null) {
+          await _secureStorage.write(key: 'access_token', value: accessToken);
+        }
+        if (refreshToken != null) {
+          await _secureStorage.write(key: 'refresh_token', value: refreshToken);
+        }
+        if (expiresIn != null) {
+          final expiresAt = DateTime.now().toUtc().add(Duration(seconds: expiresIn as int)).millisecondsSinceEpoch.toString();
+          await _secureStorage.write(key: 'access_token_expires_at', value: expiresAt);
+        }
+
+        // Update in-memory session
+        await _clearSession();
+        if (user != null) {
+          _currentUsername = user['email'] as String? ?? email;
+          _currentUserId = user['id'] as String? ?? email.split('@').first;
+          _currentRole = (user['role'] as String?) ?? 'customer';
+        } else {
+          _currentUsername = email;
+          _currentUserId = email.split('@').first;
+          _currentRole = 'customer';
+        }
+        _isSessionActive = true;
+
+        debugPrint('✅ Login successful (proxied): $email, role: $_currentRole');
+
+        return {
+          'success': true,
+          'user': user,
+          'userId': _currentUserId,
+          'role': _currentRole,
+        };
+      } else {
+        debugPrint('❌ Login failed (backend): ${resp.statusCode} ${resp.data}');
         return {'success': false, 'message': 'Invalid email or password'};
       }
-
-      if (user['password'] != hashedPassword) {
-        debugPrint('❌ Invalid password for: $email');
-        return {'success': false, 'message': 'Invalid email or password'};
-      }
-
-      // Login successful
-      await _clearSession();
-      _currentUsername = user['email'] as String;
-      _currentRole = user['role'] as String? ?? 'customer';
-      _currentUserId = user['id'] as String;
-      _isSessionActive = true;
-
-      debugPrint('✅ Login successful: $email, role: $_currentRole');
-
-      return {
-        'success': true,
-        'user': user,
-        'userId': user['id'],
-        'role': _currentRole,
-      };
     } catch (e) {
       debugPrint('❌ Login error: $e');
       return {'success': false, 'message': 'An error occurred during login'};
@@ -242,8 +270,82 @@ class AuthService {
   // Sign out
   Future<void> signOut() async {
     debugPrint('🚪 Signing out user: $_currentUsername');
+    // Clear secure storage tokens
+    try {
+      await _secureStorage.delete(key: 'access_token');
+      await _secureStorage.delete(key: 'refresh_token');
+      await _secureStorage.delete(key: 'access_token_expires_at');
+    } catch (e) {
+      debugPrint('⚠️ Error clearing secure storage: $e');
+    }
+
     await _clearSession();
     debugPrint('✅ Logout complete');
+  }
+
+  // Get a valid access token, refreshing if necessary
+  Future<String?> getAccessToken() async {
+    try {
+      final accessToken = await _secureStorage.read(key: 'access_token');
+      final expiresAtStr = await _secureStorage.read(key: 'access_token_expires_at');
+
+      if (accessToken == null) return null;
+
+      if (expiresAtStr != null) {
+        final expiresAt = int.tryParse(expiresAtStr) ?? 0;
+        final now = DateTime.now().toUtc().millisecondsSinceEpoch;
+        // If token will expire within next 30 seconds, refresh it
+        if (now >= expiresAt - 30000) {
+          final refreshed = await _refreshToken();
+          if (!refreshed) return null;
+          return await _secureStorage.read(key: 'access_token');
+        }
+      }
+
+      return accessToken;
+    } catch (e) {
+      debugPrint('⚠️ getAccessToken error: $e');
+      return null;
+    }
+  }
+
+  // Refresh access token via backend proxy
+  Future<bool> _refreshToken() async {
+    try {
+      final refreshToken = await _secureStorage.read(key: 'refresh_token');
+      if (refreshToken == null) return false;
+
+      final url = '${SupabaseConfig.backendUrl}/refresh';
+      final resp = await _dio.post(url, data: {'refresh_token': refreshToken});
+
+      if (resp.statusCode == 200) {
+        final data = resp.data;
+        final accessToken = data['access_token'] as String?;
+        final refreshTokenNew = data['refresh_token'] as String?;
+        final expiresIn = data['expires_in'];
+
+        if (accessToken != null) {
+          await _secureStorage.write(key: 'access_token', value: accessToken);
+        }
+        if (refreshTokenNew != null) {
+          await _secureStorage.write(key: 'refresh_token', value: refreshTokenNew);
+        }
+        if (expiresIn != null) {
+          final expiresAt = DateTime.now().toUtc().add(Duration(seconds: expiresIn as int)).millisecondsSinceEpoch.toString();
+          await _secureStorage.write(key: 'access_token_expires_at', value: expiresAt);
+        }
+
+        return true;
+      }
+
+      // Refresh failed
+      await signOut();
+      return false;
+    } catch (e) {
+      debugPrint('⚠️ _refreshToken error: $e');
+      await signOut();
+      return false;
+    }
   }
 
   // Delete account
