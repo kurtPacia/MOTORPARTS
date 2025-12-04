@@ -20,6 +20,10 @@ JWT_SECRET = os.getenv("JWT_SECRET", "change_me")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 DB_PATH = os.getenv("DATABASE_URL", "sqlite:///./users.db").replace("sqlite:///./", "")
 
+# Lockout policy for repeated failed logins (per-email, stored in SQLite)
+MAX_FAILED_ATTEMPTS = int(os.getenv("MAX_FAILED_ATTEMPTS", "5"))
+LOCKOUT_SECONDS = int(os.getenv("LOCKOUT_SECONDS", "180"))  # default 3 minutes
+
 # Supabase proxy configuration (optional). If set, the backend will forward
 # login requests to Supabase Auth and return Supabase's response. Requires
 # `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` to be set in the environment.
@@ -57,6 +61,17 @@ def initialize_db():
         )
         """
     )
+    # Table to track failed login attempts and temporary lockouts (per email)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            email TEXT PRIMARY KEY,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_attempt TEXT,
+            locked_until TEXT
+        )
+        """
+    )
     cur.execute("SELECT COUNT(*) AS c FROM users")
     row = cur.fetchone()
     if row is None or row[0] == 0:
@@ -67,6 +82,59 @@ def initialize_db():
             conn.commit()
         except Exception:
             pass
+    conn.close()
+
+
+def _get_attempt_row(email: str):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT attempts, last_attempt, locked_until FROM login_attempts WHERE email = ?", (email,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def is_locked(email: str):
+    row = _get_attempt_row(email)
+    if not row:
+        return False, 0
+    locked_until = row["locked_until"]
+    if not locked_until:
+        return False, 0
+    try:
+        locked_dt = datetime.fromisoformat(locked_until)
+    except Exception:
+        return False, 0
+    now = datetime.utcnow()
+    if now < locked_dt:
+        return True, int((locked_dt - now).total_seconds())
+    return False, 0
+
+
+def record_failed_attempt(email: str):
+    now = datetime.utcnow()
+    row = _get_attempt_row(email)
+    conn = get_db_conn()
+    cur = conn.cursor()
+    if not row:
+        cur.execute("INSERT INTO login_attempts (email, attempts, last_attempt) VALUES (?, ?, ?)", (email, 1, now.isoformat()))
+    else:
+        attempts = row["attempts"] + 1
+        if attempts >= MAX_FAILED_ATTEMPTS:
+            # set lockout window and reset attempts
+            locked_until = (now + timedelta(seconds=LOCKOUT_SECONDS)).isoformat()
+            cur.execute("REPLACE INTO login_attempts (email, attempts, last_attempt, locked_until) VALUES (?, ?, ?, ?)", (email, 0, now.isoformat(), locked_until))
+        else:
+            cur.execute("REPLACE INTO login_attempts (email, attempts, last_attempt, locked_until) VALUES (?, ?, ?, NULL)", (email, attempts, now.isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def reset_attempts(email: str):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM login_attempts WHERE email = ?", (email,))
+    conn.commit()
     conn.close()
 
 
@@ -82,6 +150,11 @@ async def login(payload: LoginIn, request: Request):
     # Auth endpoint and return its response. This keeps user management
     # centralized in Supabase while allowing this backend to enforce
     # rate-limits and additional business logic.
+    # Check per-email lockout before attempting auth (works for both Supabase proxy and local auth)
+    locked, remaining = is_locked(payload.email)
+    if locked:
+        raise HTTPException(status_code=429, detail=f"Too many failed attempts. Try again in {remaining} seconds")
+
     if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
         target = f"{SUPABASE_URL.rstrip('/')}/auth/v1/token?grant_type=password"
         headers = {
@@ -95,11 +168,20 @@ async def login(payload: LoginIn, request: Request):
             raise HTTPException(status_code=502, detail="Auth proxy error")
 
         if resp.status_code != 200:
+            # record failed attempt for this email
+            try:
+                record_failed_attempt(payload.email)
+            except Exception:
+                pass
             # forward Supabase error message when available, but avoid leaking internals
             detail = resp.json().get("error_description") or resp.json().get("error") or "Invalid credentials"
             raise HTTPException(status_code=401, detail=detail)
 
-        # Successful: return Supabase's session JSON (access_token, refresh_token, user, etc.)
+        # Successful: clear attempt counter and return Supabase's session JSON
+        try:
+            reset_attempts(payload.email)
+        except Exception:
+            pass
         return resp.json()
 
     # Fallback: local SQLite-based auth (useful for testing without Supabase)
@@ -110,14 +192,34 @@ async def login(payload: LoginIn, request: Request):
     conn.close()
 
     if not row:
+        # Do not reveal whether the user exists; record failed attempt and return generic error
+        try:
+            record_failed_attempt(payload.email)
+        except Exception:
+            pass
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     password_hash = row["password_hash"]
     if not pwd_context.verify(payload.password, password_hash):
+        # Wrong password: record failed attempt and inform user generally
+        try:
+            record_failed_attempt(payload.email)
+        except Exception:
+            pass
+        # Optionally provide remaining time if the action triggered a lockout
+        locked, remaining = is_locked(payload.email)
+        if locked:
+            raise HTTPException(status_code=429, detail=f"Too many failed attempts. Try again in {remaining} seconds")
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     expires = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     token = jwt.encode({"sub": payload.email, "exp": expires}, JWT_SECRET, algorithm="HS256")
+
+    # Successful login: reset failed-attempt tracking
+    try:
+        reset_attempts(payload.email)
+    except Exception:
+        pass
 
     return {"access_token": token, "token_type": "bearer"}
 
